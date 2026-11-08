@@ -1,151 +1,146 @@
 #include <HTTPHandler.h>
-
-void handleRoot() {
-  server.send(
-    200,
-    "text/plain",
-    "ESP32 Wi-Fi Provisioning Server"
-  );
-}
-
-void handleScan() {
-  Serial.println("Scanning Wi-Fi networks...");
-
-  int count = WiFi.scanNetworks();
-
-  JsonDocument doc;
-  JsonArray networks = doc["networks"].to<JsonArray>();
-
-  for (int i = 0; i < count; i++) {
-    JsonObject network = networks.add<JsonObject>();
-
-    network["ssid"] = WiFi.SSID(i);
-    network["rssi"] = WiFi.RSSI(i);
-    network["channel"] = WiFi.channel(i);
-    network["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
-    network["bssid"] = WiFi.BSSIDstr(i);
-  }
-
-  String response;
-  serializeJson(doc, response);
-
-  server.send(200, "application/json", response);
-
-  WiFi.scanDelete();
-}
-
-void handleConnect() {
-  if (!server.hasArg("plain")) {
-    server.send(400, "application/json",
-                "{\"error\":\"Missing request body\"}");
-    return;
-  }
-
-  JsonDocument doc;
-
-  DeserializationError error =
-    deserializeJson(doc, server.arg("plain"));
-
-  if (error) {
-    server.send(400, "application/json",
-                "{\"error\":\"Invalid JSON\"}");
-    return;
-  }
-
-  const char* ssid = doc["ssid"];
-  const char* password = doc["password"];
-
-  if (ssid == nullptr || password == nullptr ||
-      strlen(ssid) == 0) {
-    server.send(400, "application/json",
-                "{\"error\":\"SSID and password required\"}");
-    return;
-  }
-
-  pendingSSID = String(ssid);
-  pendingPassword = String(password);
-
-  connectionPending = true;
-  credentialsSaved = false;
-  connectionStartTime = millis();
-
-  WiFi.disconnect(false, false);
-  WiFi.begin(pendingSSID.c_str(), pendingPassword.c_str());
-
-  Serial.print("Attempting connection to: ");
-  Serial.println(pendingSSID);
-
-  server.send(202, "application/json",
-              "{\"status\":\"connecting\"}");
-}
-
-void handleStatus() {
-  JsonDocument doc;
-
-  if (WiFi.status() == WL_CONNECTED) {
-    doc["status"] = "connected";
-    doc["ssid"] = WiFi.SSID();
-    doc["ip"] = WiFi.localIP().toString();
-    doc["rssi"] = WiFi.RSSI();
-
-    // Save credentials only after successful connection.
-    if (connectionPending && !credentialsSaved) {
-      preferences.begin("wifi-config", false);
-      preferences.putString("ssid", pendingSSID);
-      preferences.putString("password", pendingPassword);
-      preferences.end();
-
-      credentialsSaved = true;
-      connectionPending = false;
-
-      Serial.println("Wi-Fi credentials saved.");
-    }
-  } else if (connectionPending) {
-    if (millis() - connectionStartTime > WIFI_TIMEOUT_MS) {
-      connectionPending = false;
-
-      doc["status"] = "failed";
-      doc["message"] = "Connection timeout";
-    } else {
-      doc["status"] = "connecting";
-    }
-  } else {
-    doc["status"] = "disconnected";
-  }
-
-  String response;
-  serializeJson(doc, response);
-
-  server.send(200, "application/json", response);
-}
-
-void handleReset() {
-  preferences.begin("wifi-config", false);
-  preferences.clear();
-  preferences.end();
-
-  WiFi.disconnect(true, true);
-
-  connectionPending = false;
-  credentialsSaved = false;
-
-  server.send(200, "application/json",
-              "{\"status\":\"credentials_erased\"}");
-
-  Serial.println("Saved Wi-Fi credentials erased.");
-}
-
-// -------------------- Server setup --------------------
+#include <NetworkSetup.h>
+#include <ControlTasks.h>
+#include <ArduinoJson.h>
 
 void setupServer() {
-  server.on("/", HTTP_GET, handleRoot);
 
-  server.on("/wifi/scan", HTTP_GET, handleScan);
-  server.on("/wifi/connect", HTTP_POST, handleConnect);
-  server.on("/wifi/status", HTTP_GET, handleStatus);
-  server.on("/wifi/reset", HTTP_POST, handleReset);
+    // Root page
+    server.on("/", HTTP_GET, []() {
+        server.send(200, "text/plain",
+                    "ESP32 Clothesline Controller");
+    });
 
-  server.begin();
+    
+    // Rain sensor status
+    server.on("/rain/status", HTTP_GET, []() {
 
-  Serial.println("HTTP server started.");
+        bool rainDetected;
+
+        // Safely read the shared rain state.
+        if (xSemaphoreTake(rainMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+            server.send(503, "application/json",
+                        "{\"error\":\"Rain sensor status temporarily unavailable\"}");
+            return;
+        }
+
+        rainDetected = currentRainState;
+
+        xSemaphoreGive(rainMutex);
+
+        StaticJsonDocument<128> doc;
+
+        doc["rainDetected"] = rainDetected;
+
+        String response;
+        serializeJson(doc, response);
+
+        server.send(200, "application/json", response);
+    });
+
+    // Wi-Fi status
+    server.on("/wifi/status", HTTP_GET, []() {
+        StaticJsonDocument<256> doc;
+
+        doc["connected"] = WiFi.status() == WL_CONNECTED;
+        doc["ssid"] = WiFi.SSID();
+        doc["routerIP"] = WiFi.localIP().toString();
+        doc["setupAP"] = WiFi.softAPIP().toString();
+
+        String response;
+        serializeJson(doc, response);
+
+        server.send(200, "application/json", response);
+    });
+
+    // Save and connect to new Wi-Fi credentials
+    server.on("/wifi/connect", HTTP_POST, []() {
+        StaticJsonDocument<256> doc;
+
+        DeserializationError error =
+            deserializeJson(doc, server.arg("plain"));
+
+        if (error) {
+            server.send(400, "application/json",
+                        "{\"error\":\"Invalid JSON\"}");
+            return;
+        }
+
+        String ssid = doc["ssid"] | "";
+        String password = doc["password"] | "";
+
+        if (ssid.isEmpty()) {
+            server.send(400, "application/json",
+                        "{\"error\":\"SSID is required\"}");
+            return;
+        }
+
+        preferences.begin("wifi-config", false);
+        preferences.putString("ssid", ssid);
+        preferences.putString("password", password);
+        preferences.end();
+
+        beginWiFiConnection(ssid, password);
+
+        server.send(200, "application/json",
+                    "{\"message\":\"Wi-Fi connection started\"}");
+    });
+
+    //Scan Networks
+    server.on("/wifi/scan", HTTP_GET, []() {
+        int n = WiFi.scanNetworks();
+        StaticJsonDocument<512> doc;
+
+        JsonArray networks = doc.createNestedArray("networks");
+
+        for (int i = 0; i < n; ++i) {
+            JsonObject network = networks.createNestedObject();
+            network["ssid"] = WiFi.SSID(i);
+            network["rssi"] = WiFi.RSSI(i);
+            network["channel"] = WiFi.channel(i);
+            network["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+            network["bssid"] = WiFi.BSSIDstr(i);
+        }
+
+        String response;
+        serializeJson(doc, response);
+
+        server.send(200, "application/json", response);
+    });
+
+    // Manual servo deploy
+    server.on("/servo/deploy", HTTP_POST, []() {
+        ManualCommand command = CMD_DEPLOY;
+
+        if (xQueueSend(manualQueue, &command, 0) != pdTRUE) {
+            server.send(503, "application/json",
+                        "{\"error\":\"Command queue full\"}");
+            return;
+        }
+
+        server.send(200, "application/json",
+                    "{\"message\":\"Deploy command accepted\"}");
+    });
+
+    // Manual servo retract
+    server.on("/servo/retract", HTTP_POST, []() {
+        ManualCommand command = CMD_RETRACT;
+
+        if (xQueueSend(manualQueue, &command, 0) != pdTRUE) {
+            server.send(503, "application/json",
+                        "{\"error\":\"Command queue full\"}");
+            return;
+        }
+
+        server.send(200, "application/json",
+                    "{\"message\":\"Retract command accepted\"}");
+    });
+
+    server.onNotFound([]() {
+        server.send(404, "text/plain", "Not found");
+    });
+
+    server.begin();
+
+    Serial.println("HTTP server started.");
 }

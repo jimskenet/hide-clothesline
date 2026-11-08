@@ -1,68 +1,214 @@
 #include <Arduino.h>
-// #include <NetworkSetup.h>
-// #include <HTTPHandler.h>
-// #include <ServoControl.h>
-// #include <RainSensor.h>
+#include <NetworkSetup.h>
+#include <HTTPHandler.h>
+#include <ServoControl.h>
+#include <RainSensor.h>
+#include <ControlTasks.h>
 
-// #define RAIN_SENSOR_PIN 27
-// Servo myServo; 
+// ---------------- Pin configuration ----------------
 
-// void setup() {
-//   Serial.begin(115200);
-//   delay(1000);
+#define RAIN_SENSOR_PIN 27
+#define SERVO_PIN 13
 
-//   // startSavedWiFiConnection();
+// ---------------- Servo positions ----------------
 
-//   // setupServer();
+#define SERVO_SHELTERED_ANGLE 0
+#define SERVO_EXPOSED_ANGLE   90
 
-//   myServo.attach(13);
-//   pinMode(RAIN_SENSOR_PIN, INPUT);
-// }
+// ---------------- Global objects ----------------
 
-// void loop() {
-//   // server.handleClient();
-//   Serial.println("Checking rain sensor...");
-//   Serial.print(digitalRead(RAIN_SENSOR_PIN));
-//   Serial.println();
+Servo myServo;
 
-//   if(rain_detected(RAIN_SENSOR_PIN)) {
-//     move_zero(&myServo);
-//   }
-//   else {
-//     move_ninety(&myServo);                                
-//   }
-//   delay(500);
-// }                             
+QueueHandle_t rainQueue;
+QueueHandle_t manualQueue;
+bool currentRainState = false;
+SemaphoreHandle_t rainMutex;
 
-/*
- * This ESP32 code is created by esp32io.com
- *
- * This ESP32 code is released in the public domain
- *
- * For more detail (instruction and wiring diagram), visit https://esp32io.com/tutorials/esp32-rain-sensor
- */
+// ---------------- Sensor Task ----------------
+void SensorTask(void* parameter) {
+    bool rainState;
 
-#define DO_PIN 27
-#define AO_PIN 34
+    while (true) {
+        rainState = rain_detected(RAIN_SENSOR_PIN);
 
-void setup() {
-  Serial.begin(115200);
+        // Update the shared rain status.
+        if (xSemaphoreTake(rainMutex, portMAX_DELAY) == pdTRUE) {
+            currentRainState = rainState;
+            xSemaphoreGive(rainMutex);
+        }
 
-  analogReadResolution(12);
-  analogSetPinAttenuation(AO_PIN, ADC_11db);
+        // Update the queue for ServoTask.
+        xQueueOverwrite(rainQueue, &rainState);
 
-  pinMode(DO_PIN, INPUT);
+        Serial.print("Rain sensor: ");
+        Serial.println(rainState ? "RAIN DETECTED" : "DRY");
+
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
 }
 
+// ---------------- Servo Task ----------------
+
+void ServoTask(void* parameter) {
+    bool rainState = false;
+    bool lastRainState = false;
+
+    ManualCommand command;
+
+    int currentAngle = SERVO_EXPOSED_ANGLE;
+
+    // Initialize servo to exposed position.
+    myServo.write(currentAngle);
+
+    while (true) {
+
+        // Read newest rain sensor state.
+        if (xQueueReceive(rainQueue, &rainState, 0) == pdTRUE) {
+            lastRainState = rainState;
+        }
+
+        // Rain takes priority over manual commands.
+        if (lastRainState) {
+
+            if (currentAngle != SERVO_SHELTERED_ANGLE) {
+                currentAngle = SERVO_SHELTERED_ANGLE;
+                myServo.write(currentAngle);
+
+                Serial.println("Rain detected -> servo sheltered.");
+            }
+
+            // Discard any queued manual commands while raining.
+            while (xQueueReceive(manualQueue, &command, 0) == pdTRUE) {
+                // Intentionally discard.
+            }
+        }
+        else {
+            // Process manual commands only when dry.
+            if (xQueueReceive(manualQueue, &command, 0) == pdTRUE) {
+
+                if (command == CMD_DEPLOY) {
+                    currentAngle = SERVO_EXPOSED_ANGLE;
+                    myServo.write(currentAngle);
+
+                    Serial.println("Manual command -> servo exposed.");
+                }
+
+                else if (command == CMD_RETRACT) {
+                    currentAngle = SERVO_SHELTERED_ANGLE;
+                    myServo.write(currentAngle);
+
+                    Serial.println("Manual command -> servo sheltered.");
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+// ---------------- Wi-Fi / HTTP Task ----------------
+
+void WiFiTask(void* parameter) {
+    unsigned long lastStatusPrint = 0;
+
+    while (true) {
+
+        // WebServer is accessed ONLY from this task.
+        server.handleClient();
+
+        // Print Wi-Fi status periodically without blocking.
+        if (millis() - lastStatusPrint >= 10000) {
+            lastStatusPrint = millis();
+
+            if (WiFi.status() == WL_CONNECTED) {
+                Serial.print("Wi-Fi connected. Router IP: ");
+                Serial.println(WiFi.localIP());
+            } else {
+                Serial.println("Wi-Fi station not connected.");
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// ---------------- Setup ----------------
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    pinMode(RAIN_SENSOR_PIN, INPUT);
+   
+    rainMutex = xSemaphoreCreateMutex();
+
+    if (rainMutex == nullptr) {
+        Serial.println("Failed to create rain mutex!");
+        while (true) {
+            delay(1000);
+        }
+    }
+
+    bool initialRainState = rain_detected(RAIN_SENSOR_PIN);
+    currentRainState = initialRainState;
+        
+    myServo.attach(SERVO_PIN);
+
+    // Rain queue holds only the most recent rain state.
+    rainQueue = xQueueCreate(1, sizeof(bool));
+
+    // Manual commands can be buffered.
+    manualQueue = xQueueCreate(5, sizeof(ManualCommand));
+
+    if (rainQueue == nullptr || manualQueue == nullptr) {
+        Serial.println("Failed to create queues!");
+        while (true) {
+            delay(1000);
+        }
+    }
+
+    xQueueOverwrite(rainQueue, &initialRainState);
+
+    // Start AP and initiate saved Wi-Fi connection without waiting.
+    startSavedWiFiConnection();
+
+    // Register routes and start the web server.
+    setupServer();
+
+    // Create independent FreeRTOS tasks.
+    xTaskCreate(
+        SensorTask,
+        "SensorTask",
+        2048,
+        nullptr,
+        2,
+        nullptr
+    );
+
+    xTaskCreate(
+        ServoTask,
+        "ServoTask",
+        2048,
+        nullptr,
+        3,
+        nullptr
+    );
+
+    xTaskCreate(
+        WiFiTask,
+        "WiFiTask",
+        4096,
+        nullptr,
+        1,
+        nullptr
+    );
+
+    Serial.println("All tasks started.");
+}
+
+// ---------------- Arduino loop ----------------
+
 void loop() {
-  int rain_state = digitalRead(DO_PIN);
-  int rain_value = analogRead(AO_PIN);
-
-  Serial.print("Digital: ");
-  Serial.print(rain_state);
-
-  Serial.print(" | Analog: ");
-  Serial.println(rain_value);
-
-  delay(1000);
+    // FreeRTOS tasks handle the actual work.
+    vTaskDelay(portMAX_DELAY);
 }
